@@ -1,0 +1,219 @@
+##nifty-iv-reconstruction
+
+import pandas as pd
+import numpy as np
+import re
+import warnings
+from scipy.interpolate import PchipInterpolator, Akima1DInterpolator, interp1d
+from itertools import product
+
+warnings.filterwarnings('ignore')
+np.random.seed(42)
+
+df_wide = pd.read_csv('/content/dataset[1].csv')
+option_cols = [c for c in df_wide.columns if c not in ('datetime', 'underlying_price')]
+
+def parse_ticker(col):
+    m = re.match(r'NIFTY\d{2}[A-Z]{3}\d{2}(\d+)(CE|PE)$', col)
+    if m:
+        return int(m.group(1)), m.group(2)
+    return None, None
+
+df_long = df_wide.melt(
+    id_vars=['datetime', 'underlying_price'],
+    value_vars=option_cols,
+    var_name='ticker',
+    value_name='iv'
+)
+parsed = df_long['ticker'].apply(
+    lambda x: pd.Series(parse_ticker(x), index=['strike', 'option_type'])
+)
+df_long = pd.concat([df_long.drop(columns='ticker'), parsed], axis=1)
+df_long['strike']          = df_long['strike'].astype(float)
+df_long['datetime_parsed'] = pd.to_datetime(df_long['datetime'], dayfirst=True)
+df_long['is_missing']      = df_long['iv'].isna()
+
+
+df_long['log_moneyness']   = np.log(df_long['strike'] / df_long['underlying_price'])
+
+df_long = df_long.sort_values(['datetime_parsed', 'option_type', 'log_moneyness']).reset_index(drop=True)
+print(f'[1] Long format loaded | Missing IVs: {df_long["is_missing"].sum()}')
+
+
+
+def get_valid_ivs(sub):
+    base = sub['iv'].notna() & (sub['iv'] >= 0.02) & (sub['iv'] <= 3.0)
+    if base.sum() < 2:
+        return sub[base]
+
+    clean_iv  = sub.loc[base, 'iv']
+    median_iv = clean_iv.median()
+    mad       = (clean_iv - median_iv).abs().median()
+    mad       = max(mad, median_iv * 0.05)
+    soft_cap  = max(median_iv + 5 * mad, 0.8)
+
+    final_mask = base & (sub['iv'] <= soft_cap)
+    return sub[final_mask]
+
+
+
+def fill_vector(known_xs, known_ivs, all_xs, interpolator, tail_method):
+    pred = np.full(len(all_xs), np.nan)
+    if len(known_xs) == 0:
+        return pred
+    if len(known_xs) == 1:
+        return np.clip(np.full(len(all_xs), known_ivs[0]), 0.0, None)
+
+    sort_idx = np.argsort(known_xs)
+    x  = known_xs[sort_idx]
+    iv = known_ivs[sort_idx]
+    max_iv = iv.max()
+
+    min_x, max_x = x[0], x[-1]
+    internal   = (all_xs >= min_x) & (all_xs <= max_x)
+    left_tail  = all_xs < min_x
+    right_tail = all_xs > max_x
+
+    if internal.any():
+        xs = all_xs[internal]
+        if interpolator == 'pchip':
+            pred[internal] = PchipInterpolator(x, iv)(xs)
+        elif interpolator == 'akima':
+            pred[internal] = Akima1DInterpolator(x, iv)(xs) if len(x) >= 3 else PchipInterpolator(x, iv)(xs)
+        elif interpolator == 'linear':
+            pred[internal] = interp1d(x, iv, kind='linear', bounds_error=False, fill_value=np.nan)(xs)
+
+    
+    for mask, is_left in [(left_tail, True), (right_tail, False)]:
+        if not mask.any():
+            continue
+        xs = all_xs[mask]
+
+        if tail_method == 'flat':
+            pred[mask] = iv[0] if is_left else iv[-1]
+
+        elif tail_method == 'linear_extrap':
+            if len(x) >= 2:
+                if is_left:
+                    slope = (iv[1] - iv[0]) / (x[1] - x[0])
+                    pred[mask] = iv[0] + slope * (xs - x[0])
+                else:
+                    slope = (iv[-1] - iv[-2]) / (x[-1] - x[-2])
+                    pred[mask] = iv[-1] + slope * (xs - x[-1])
+            else:
+                pred[mask] = iv[0] if is_left else iv[-1]
+
+        elif tail_method == 'clipped_quadratic':
+            n_pts = min(3, len(x))
+            deg   = min(2, n_pts - 1)
+            anchor_x  = x[:n_pts]  if is_left else x[-n_pts:]
+            anchor_iv = iv[:n_pts] if is_left else iv[-n_pts:]
+            if deg >= 1:
+                poly = np.poly1d(np.polyfit(anchor_x, anchor_iv, deg=deg))
+                pred[mask] = np.clip(poly(xs), 0.0, 1.5 * max_iv)
+            else:
+                pred[mask] = anchor_iv[0]
+
+    return np.clip(pred, 0.0, None)
+
+
+def impute_snapshot(group, interpolator, tail_method):
+    group = group.copy()
+    group['iv_pred'] = np.nan
+
+    for opt_type in ['PE', 'CE']:
+        mask = group['option_type'] == opt_type
+        sub  = group[mask].sort_values('log_moneyness')
+        if len(sub) == 0:
+            continue
+
+        clean = get_valid_ivs(sub)
+        if len(clean) == 0:
+            continue
+
+        filled = fill_vector(
+            clean['log_moneyness'].values,
+            clean['iv'].values,
+            sub['log_moneyness'].values,
+            interpolator,
+            tail_method
+        )
+        group.loc[sub.index, 'iv_pred'] = filled
+
+    return group
+
+
+def apply_all_methods(df, methods):
+    preds_all = {}
+    for interpolator, tail_method in methods:
+        df_filled = df.groupby('datetime', group_keys=False).apply(
+            lambda g: impute_snapshot(g, interpolator, tail_method)
+        )
+        preds_all[(interpolator, tail_method)] = df_filled['iv_pred'].values.copy()
+    return preds_all
+
+
+
+def build_masked_validation_set(df, mask_frac=0.20, seed=42):
+    rng = np.random.default_rng(seed)
+    df_masked   = df.copy()
+    val_records = []
+    for (dt, ot), grp in df.groupby(['datetime', 'option_type']):
+        valid_grp = get_valid_ivs(grp)
+        if len(valid_grp) < 3:
+            continue
+        n_mask = max(1, int(round(len(valid_grp) * mask_frac)))
+        chosen = rng.choice(valid_grp.index.tolist(), size=min(n_mask, len(valid_grp)), replace=False)
+        for idx in chosen:
+            val_records.append({'index': idx, 'true_iv': df.at[idx, 'iv']})
+            df_masked.at[idx, 'iv'] = np.nan
+    return df_masked, pd.DataFrame(val_records).set_index('index')
+
+
+print('[2] Building shifted validation matrix...')
+df_masked, val_df = build_masked_validation_set(df_long)
+
+METHODS = list(product(['pchip', 'akima', 'linear'], ['flat', 'linear_extrap', 'clipped_quadratic']))
+all_preds_masked = apply_all_methods(df_masked, METHODS)
+
+results = []
+for (interpolator, tail_method), preds in all_preds_masked.items():
+    trues  = val_df['true_iv'].values
+    p      = preds[val_df.index]
+    valid  = ~np.isnan(p)
+    mse    = np.mean((p[valid] - trues[valid])**2) if valid.sum() > 0 else np.inf
+    results.append({'interpolator': interpolator, 'tail_method': tail_method, 'mse': mse})
+
+results_df = pd.DataFrame(results).sort_values('mse').reset_index(drop=True)
+top3 = results_df.head(3).copy()
+top3['weight'] = (1.0 / top3['mse'])
+top3['weight'] /= top3['weight'].sum()
+
+print('[3] Reconstructing final surface ensemble predictions...')
+all_preds_real = apply_all_methods(df_long, METHODS)
+
+ensemble_preds = np.zeros(len(df_long))
+for _, row in top3.iterrows():
+    key = (row['interpolator'], row['tail_method'])
+    ensemble_preds += row['weight'] * all_preds_real[key]
+
+df_long['iv_ensemble'] = ensemble_preds
+df_long['value'] = np.where(df_long['is_missing'], df_long['iv_ensemble'], df_long['iv'])
+
+
+df_long['value'] = df_long.groupby('datetime')['value'].transform(lambda s: s.bfill().ffill())
+
+
+remaining = df_long['value'].isna().sum()
+if remaining > 0:
+    df_long = df_long.sort_values('datetime_parsed').reset_index(drop=True)
+    df_long['value'] = df_long.groupby(['option_type', 'strike'])['value'].ffill()
+    df_long['value'] = df_long.groupby(['option_type', 'strike'])['value'].bfill()
+
+df_sub = df_long[df_long['is_missing']].copy()
+df_sub['id'] = df_sub.apply(
+    lambda r: f"{r['datetime']}||NIFTY27JAN26{int(r['strike']):05d}{r['option_type']}", axis=1
+)
+df_sub = df_sub[['id', 'value']].sort_values('id').reset_index(drop=True)
+df_sub.to_csv('submission_pipeline6.csv', index=False)
+print(f'✅ Optimizations complete. submission_pipeline6.csv saved safely.')
